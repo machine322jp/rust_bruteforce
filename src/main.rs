@@ -1,5 +1,3 @@
-
-
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -11,15 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use dashmap::{DashMap, DashSet};
 use eframe::egui;
 use egui::{Color32, RichText, Vec2};
 use num_bigint::BigUint;
-use num_traits::{One, Zero, ToPrimitive};
+use num_traits::{One, ToPrimitive, Zero};
+use rand::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
-use dashmap::{DashMap, DashSet};
-use rand::Rng;
 
 // u64 キー専用のノーハッシュ（高速化）
 use nohash_hasher::BuildNoHashHasher;
@@ -35,10 +33,10 @@ const MASK14: u16 = (1u16 << H) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cell {
-    Blank,   // '.'
-    Any,     // 'N' (空白 or 色)
-    Any4,    // 'X' (色のみ)
-    Abs(u8), // 0..12 = 'A'..'M'
+    Blank,     // '.'
+    Any,       // 'N' (空白 or 色)
+    Any4,      // 'X' (色のみ)
+    Abs(u8),   // 0..12 = 'A'..'M'
     Fixed(u8), // 0..=3 = '0'..'3' (RGBY固定)
 }
 
@@ -87,8 +85,8 @@ struct DfsDepthTimes {
     // 葉専用
     leaf_fall_pre: Duration,
     leaf_hash: Duration,
-    leaf_memo_get: Duration,           // 今回の最適化後はほぼ0のまま
-    leaf_memo_miss_compute: Duration,  // 到達判定（reaches_t...）
+    leaf_memo_get: Duration,          // 今回の最適化後はほぼ0のまま
+    leaf_memo_miss_compute: Duration, // 到達判定（reaches_t...）
     out_serialize: Duration,
 }
 #[derive(Default, Clone, Copy)]
@@ -98,9 +96,9 @@ struct DfsDepthCounts {
     pruned_upper: u64,
     leaves: u64,
     // 葉早期リターン（落下や到達判定より前）
-    leaf_pre_tshort: u64,          // 4T 未満で不可能
-    leaf_pre_e1_impossible: u64,   // E1 不可能（4連結なし）
-    memo_lhit: u64, // 以降は基本0（残しつつ非使用）
+    leaf_pre_tshort: u64,        // 4T 未満で不可能
+    leaf_pre_e1_impossible: u64, // E1 不可能（4連結なし）
+    memo_lhit: u64,              // 以降は基本0（残しつつ非使用）
     memo_ghit: u64,
     memo_miss: u64,
 }
@@ -337,17 +335,54 @@ struct AnimState {
     since: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Orient {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+#[derive(Clone, Copy)]
+struct CpMove {
+    x: usize,
+    orient: Orient,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpSearchStatus {
+    depth_limit: usize,
+    depth: usize,
+    branch_index: usize,
+    branch_count: usize,
+}
+
+enum CpSearchMessage {
+    DepthStart { depth_limit: usize },
+    Progress(CpSearchStatus),
+    Found { depth: usize, mv: CpMove },
+    Failed,
+    Cancelled,
+}
+
 // 連鎖生成モードのワーク
 struct ChainPlay {
     cols: [[u16; W]; 4],
     pair_seq: Vec<(u8, u8)>, // 軸, 子（0..=3）
     pair_index: usize,
+    target_chain: u32,
     undo_stack: Vec<SavedState>,
     anim: Option<AnimState>,
     lock: bool, // 連鎖アニメ中ロック
     // アニメ表示用：消去直後の盤面と、落下後の次盤面
     erased_cols: Option<[[u16; W]; 4]>,
     next_cols: Option<[[u16; W]; 4]>,
+    search_rx: Option<Receiver<CpSearchMessage>>,
+    search_thread: Option<thread::JoinHandle<()>>,
+    search_cancel: Option<Arc<AtomicBool>>,
+    search_status: Option<CpSearchStatus>,
+    search_depth_limit: Option<usize>,
+    pending_target: Option<u32>,
 }
 
 impl Default for ChainPlay {
@@ -358,22 +393,450 @@ impl Default for ChainPlay {
             seq.push((rng.gen_range(0..4), rng.gen_range(0..4)));
         }
         let cols = [[0u16; W]; 4];
-        let s0 = SavedState { cols, pair_index: 0 };
+        let s0 = SavedState {
+            cols,
+            pair_index: 0,
+        };
         Self {
             cols,
             pair_seq: seq,
             pair_index: 0,
+            target_chain: 3,
             undo_stack: vec![s0],
             anim: None,
             lock: false,
             erased_cols: None,
             next_cols: None,
+            search_rx: None,
+            search_thread: None,
+            search_cancel: None,
+            search_status: None,
+            search_depth_limit: None,
+            pending_target: None,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Orient { Up, Right, Down, Left }
+#[inline(always)]
+fn orient_symbol(orient: Orient) -> &'static str {
+    match orient {
+        Orient::Up => "↑",
+        Orient::Right => "→",
+        Orient::Down => "↓",
+        Orient::Left => "←",
+    }
+}
+
+#[inline(always)]
+fn col_height_from_cols(cols: &[[u16; W]; 4], x: usize) -> usize {
+    debug_assert!(x < W);
+    let occ = (cols[0][x] | cols[1][x] | cols[2][x] | cols[3][x]) & MASK14;
+    occ.count_ones() as usize
+}
+
+#[inline(always)]
+fn calc_col_heights(cols: &[[u16; W]; 4]) -> [usize; W] {
+    let mut heights = [0usize; W];
+    for x in 0..W {
+        heights[x] = col_height_from_cols(cols, x);
+    }
+    heights
+}
+
+#[inline(always)]
+fn count_valid_moves(heights: &[usize; W]) -> usize {
+    let mut total = 0usize;
+    for x in 0..W {
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            total += 2; // Up + Down
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            total += 1; // Right
+        }
+        if x >= 1 && heights[x - 1] < H {
+            total += 1; // Left
+        }
+    }
+    total
+}
+
+#[inline(always)]
+fn set_cell_in_cols(cols: &mut [[u16; W]; 4], x: usize, y: usize, color: u8) {
+    debug_assert!(x < W && y < H);
+    let bit = 1u16 << y;
+    let idx = (color as usize).min(3);
+    cols[idx][x] |= bit;
+}
+
+fn simulate_move_on_cols(
+    cols: &[[u16; W]; 4],
+    heights: &[usize; W],
+    pair: (u8, u8),
+    mv: CpMove,
+) -> Option<(u32, [[u16; W]; 4])> {
+    let mut next = *cols;
+    match mv.orient {
+        Orient::Up => {
+            let h = heights[mv.x];
+            if h + 1 >= H {
+                return None;
+            }
+            set_cell_in_cols(&mut next, mv.x, h, pair.0);
+            set_cell_in_cols(&mut next, mv.x, h + 1, pair.1);
+        }
+        Orient::Down => {
+            let h = heights[mv.x];
+            if h + 1 >= H {
+                return None;
+            }
+            set_cell_in_cols(&mut next, mv.x, h, pair.1);
+            set_cell_in_cols(&mut next, mv.x, h + 1, pair.0);
+        }
+        Orient::Right => {
+            if mv.x + 1 >= W {
+                return None;
+            }
+            let h0 = heights[mv.x];
+            let h1 = heights[mv.x + 1];
+            if h0 >= H || h1 >= H {
+                return None;
+            }
+            set_cell_in_cols(&mut next, mv.x, h0, pair.0);
+            set_cell_in_cols(&mut next, mv.x + 1, h1, pair.1);
+        }
+        Orient::Left => {
+            if mv.x == 0 {
+                return None;
+            }
+            let h0 = heights[mv.x];
+            let h1 = heights[mv.x - 1];
+            if h0 >= H || h1 >= H {
+                return None;
+            }
+            set_cell_in_cols(&mut next, mv.x, h0, pair.0);
+            set_cell_in_cols(&mut next, mv.x - 1, h1, pair.1);
+        }
+    }
+
+    let mut chain = 0u32;
+    loop {
+        let clear = compute_erase_mask_cols(&next);
+        let has_clear = (0..W).any(|x| clear[x] != 0);
+        if !has_clear {
+            break;
+        }
+        chain += 1;
+        next = apply_given_clear_and_fall(&next, &clear);
+    }
+
+    Some((chain, next))
+}
+
+fn cp_run_target_search(
+    cols: [[u16; W]; 4],
+    pair_seq: Vec<(u8, u8)>,
+    start_index: usize,
+    target: u32,
+    tx: Sender<CpSearchMessage>,
+    cancel: Arc<AtomicBool>,
+) {
+    if pair_seq.is_empty() {
+        let _ = tx.send(CpSearchMessage::Failed);
+        return;
+    }
+    let seq_len = pair_seq.len();
+    for depth_limit in 1..=seq_len {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(CpSearchMessage::Cancelled);
+            return;
+        }
+        if tx
+            .send(CpSearchMessage::DepthStart { depth_limit })
+            .is_err()
+        {
+            return;
+        }
+        if let Some((depth, mv)) = cp_search_depth_limit(
+            cols,
+            &pair_seq,
+            start_index,
+            depth_limit,
+            target,
+            &tx,
+            &cancel,
+        ) {
+            let _ = tx.send(CpSearchMessage::Found { depth, mv });
+            return;
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        let _ = tx.send(CpSearchMessage::Cancelled);
+    } else {
+        let _ = tx.send(CpSearchMessage::Failed);
+    }
+}
+
+fn cp_search_depth_limit(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    start_index: usize,
+    depth_limit: usize,
+    target: u32,
+    tx: &Sender<CpSearchMessage>,
+    cancel: &AtomicBool,
+) -> Option<(usize, CpMove)> {
+    if depth_limit == 0 || pair_seq.is_empty() {
+        return None;
+    }
+    let seq_len = pair_seq.len();
+    let pair = pair_seq[start_index];
+    let heights = calc_col_heights(&cols);
+    let total = count_valid_moves(&heights);
+    if total == 0 {
+        let status = CpSearchStatus {
+            depth_limit,
+            depth: 1,
+            branch_index: 0,
+            branch_count: 0,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        return None;
+    }
+    let mut branch_index = 0usize;
+    let try_move = |mv: CpMove, branch_index: usize| -> Option<(usize, CpMove)> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let status = CpSearchStatus {
+            depth_limit,
+            depth: 1,
+            branch_index,
+            branch_count: total,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, &heights, pair, mv) {
+            if chain >= target {
+                return Some((1, mv));
+            }
+            if depth_limit > 1 {
+                let next_index = (start_index + 1) % seq_len;
+                if let Some(rest) = cp_search_recursive(
+                    next_cols,
+                    pair_seq,
+                    next_index,
+                    depth_limit - 1,
+                    target,
+                    tx,
+                    cancel,
+                    depth_limit,
+                    2,
+                ) {
+                    return Some((1 + rest, mv));
+                }
+            }
+        }
+        None
+    };
+    for x in 0..W {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Up,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Down,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Right,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x >= 1 && heights[x - 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Left,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn cp_search_recursive(
+    cols: [[u16; W]; 4],
+    pair_seq: &[(u8, u8)],
+    pair_index: usize,
+    depth_remaining: usize,
+    target: u32,
+    tx: &Sender<CpSearchMessage>,
+    cancel: &AtomicBool,
+    depth_limit_total: usize,
+    current_depth: usize,
+) -> Option<usize> {
+    if depth_remaining == 0 || pair_seq.is_empty() {
+        return None;
+    }
+    let seq_len = pair_seq.len();
+    let pair = pair_seq[pair_index];
+    let heights = calc_col_heights(&cols);
+    let total = count_valid_moves(&heights);
+    if total == 0 {
+        let status = CpSearchStatus {
+            depth_limit: depth_limit_total,
+            depth: current_depth,
+            branch_index: 0,
+            branch_count: 0,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        return None;
+    }
+    let mut branch_index = 0usize;
+    let try_move = |mv: CpMove, branch_index: usize| -> Option<usize> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let status = CpSearchStatus {
+            depth_limit: depth_limit_total,
+            depth: current_depth,
+            branch_index,
+            branch_count: total,
+        };
+        let _ = tx.send(CpSearchMessage::Progress(status));
+        if let Some((chain, next_cols)) = simulate_move_on_cols(&cols, &heights, pair, mv) {
+            if chain >= target {
+                return Some(1);
+            }
+            if depth_remaining > 1 {
+                let next_index = (pair_index + 1) % seq_len;
+                if let Some(rest) = cp_search_recursive(
+                    next_cols,
+                    pair_seq,
+                    next_index,
+                    depth_remaining - 1,
+                    target,
+                    tx,
+                    cancel,
+                    depth_limit_total,
+                    current_depth + 1,
+                ) {
+                    return Some(1 + rest);
+                }
+            }
+        }
+        None
+    };
+    for x in 0..W {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let h = heights[x];
+        if h >= H {
+            continue;
+        }
+        if h + 1 < H {
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Up,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Down,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x + 1 < W && heights[x + 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Right,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+        if x >= 1 && heights[x - 1] < H {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            branch_index += 1;
+            if let Some(found) = try_move(
+                CpMove {
+                    x,
+                    orient: Orient::Left,
+                },
+                branch_index,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
 fn install_japanese_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
@@ -400,7 +863,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
         let path = fontdir.join(name);
         if let Ok(bytes) = std::fs::read(&path) {
             let key = format!("jp-{}", name.to_lowercase());
-            fonts.font_data.insert(key.clone(), FontData::from_owned(bytes));
+            fonts
+                .font_data
+                .insert(key.clone(), FontData::from_owned(bytes));
             fonts
                 .families
                 .get_mut(&FontFamily::Proportional)
@@ -419,7 +884,9 @@ fn install_japanese_fonts(ctx: &egui::Context) {
     if loaded {
         ctx.set_fonts(fonts);
     } else {
-        eprintln!("日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。");
+        eprintln!(
+            "日本語フォントを見つけられませんでした。C:\\Windows\\Fonts を確認してください。"
+        );
     }
 }
 
@@ -447,6 +914,7 @@ impl eframe::App for App {
         if self.mode == Mode::ChainPlay {
             self.cp_step_animation();
         }
+        self.cp_poll_search();
         // 受信メッセージ処理（安全：take→処理→必要なら戻す）
         if let Some(rx) = self.rx.take() {
             let mut keep_rx = true;
@@ -584,8 +1052,24 @@ impl eframe::App for App {
                         });
 
                         ui.add_space(6.0);
+                        let searching = self.cp_search_in_progress();
+                        let can_ops = !self.cp.lock && self.cp.anim.is_none() && !searching;
                         ui.horizontal(|ui| {
-                            let can_ops = !self.cp.lock && self.cp.anim.is_none();
+                            ui.label("目標連鎖数");
+                            ui.add_enabled(
+                                !searching,
+                                egui::DragValue::new(&mut self.cp.target_chain)
+                                    .clamp_range(1u32..=19u32)
+                                    .speed(1.0),
+                            );
+                            if ui
+                                .add_enabled(can_ops, egui::Button::new("目標配置"))
+                                .clicked()
+                            {
+                                self.cp_place_target();
+                            }
+                        });
+                        ui.horizontal(|ui| {
                             if ui.add_enabled(can_ops, egui::Button::new("ランダム配置")).clicked() {
                                 self.cp_place_random();
                             }
@@ -596,7 +1080,36 @@ impl eframe::App for App {
                                 self.cp_reset_to_initial();
                             }
                         });
-                        ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                        if searching {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                if let Some(status) = self.cp.search_status {
+                                    if status.branch_count > 0 {
+                                        ui.label(format!(
+                                            "探索中: 深さ制限{} / {}手目 ({} / {} 通り)",
+                                            status.depth_limit,
+                                            status.depth,
+                                            status.branch_index,
+                                            status.branch_count
+                                        ));
+                                    } else {
+                                        ui.label(format!(
+                                            "探索中: 深さ制限{} / {}手目 (有効手なし)",
+                                            status.depth_limit,
+                                            status.depth
+                                        ));
+                                    }
+                                } else if let Some(depth) = self.cp.search_depth_limit {
+                                    ui.label(format!("探索中: 深さ制限{} を走査中…", depth));
+                                } else if let Some(target) = self.cp.pending_target {
+                                    ui.label(format!("目標{}連鎖を探索中…", target));
+                                } else {
+                                    ui.label("探索中…");
+                                }
+                            });
+                        } else {
+                            ui.label(if self.cp.lock { "連鎖中…（操作ロック）" } else { "待機中" });
+                        }
                     });
                 }
 
@@ -674,49 +1187,51 @@ impl eframe::App for App {
 
         // 盤面側もスクロール可能に
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                if self.mode == Mode::BruteForce {
-                    ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
-                    ui.add_space(6.0);
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if self.mode == Mode::BruteForce {
+                        ui.label("盤面（左: A→B→…→M / 中: N↔X / 右: ・ / Shift+左: RGBY）");
+                        ui.add_space(6.0);
 
-                    let cell_size = Vec2::new(28.0, 28.0);
-                    let gap = 2.0;
+                        let cell_size = Vec2::new(28.0, 28.0);
+                        let gap = 2.0;
 
-                    let shift_pressed = ui.input(|i| i.modifiers.shift);
-                    for y in (0..H).rev() {
-                        ui.horizontal(|ui| {
-                            for x in 0..W {
-                                let i = y * W + x;
-                                let (text, fill, stroke) = cell_style(self.board[i]);
-                                let btn = egui::Button::new(RichText::new(text).size(12.0))
-                                    .min_size(cell_size)
-                                    .fill(fill)
-                                    .stroke(stroke);
-                                let resp = ui.add(btn);
-                                if resp.clicked_by(egui::PointerButton::Primary) {
-                                    if shift_pressed {
-                                        self.board[i] = cycle_fixed(self.board[i]);
-                                    } else {
-                                        self.board[i] = cycle_abs(self.board[i]);
+                        let shift_pressed = ui.input(|i| i.modifiers.shift);
+                        for y in (0..H).rev() {
+                            ui.horizontal(|ui| {
+                                for x in 0..W {
+                                    let i = y * W + x;
+                                    let (text, fill, stroke) = cell_style(self.board[i]);
+                                    let btn = egui::Button::new(RichText::new(text).size(12.0))
+                                        .min_size(cell_size)
+                                        .fill(fill)
+                                        .stroke(stroke);
+                                    let resp = ui.add(btn);
+                                    if resp.clicked_by(egui::PointerButton::Primary) {
+                                        if shift_pressed {
+                                            self.board[i] = cycle_fixed(self.board[i]);
+                                        } else {
+                                            self.board[i] = cycle_abs(self.board[i]);
+                                        }
                                     }
+                                    if resp.clicked_by(egui::PointerButton::Middle) {
+                                        self.board[i] = cycle_any(self.board[i]);
+                                    }
+                                    if resp.clicked_by(egui::PointerButton::Secondary) {
+                                        self.board[i] = Cell::Blank;
+                                    }
+                                    ui.add_space(gap);
                                 }
-                                if resp.clicked_by(egui::PointerButton::Middle) {
-                                    self.board[i] = cycle_any(self.board[i]);
-                                }
-                                if resp.clicked_by(egui::PointerButton::Secondary) {
-                                    self.board[i] = Cell::Blank;
-                                }
-                                ui.add_space(gap);
-                            }
-                        });
-                        ui.add_space(gap);
+                            });
+                            ui.add_space(gap);
+                        }
+                    } else {
+                        ui.label("連鎖生成 — 盤面");
+                        ui.add_space(6.0);
+                        draw_preview(ui, &self.cp.cols);
                     }
-                } else {
-                    ui.label("連鎖生成 — 盤面");
-                    ui.add_space(6.0);
-                    draw_preview(ui, &self.cp.cols);
-                }
-            });
+                });
         });
 
         ctx.request_repaint_after(Duration::from_millis(16));
@@ -739,7 +1254,14 @@ impl App {
         self.cp.pair_seq[idx]
     }
 
+    fn cp_search_in_progress(&self) -> bool {
+        self.cp.search_thread.is_some()
+    }
+
     fn cp_undo(&mut self) {
+        if self.cp_search_in_progress() {
+            return;
+        }
         if self.cp.undo_stack.len() > 1 && !self.cp.lock {
             self.cp.anim = None;
             self.cp.erased_cols = None;
@@ -755,7 +1277,12 @@ impl App {
     }
 
     fn cp_reset_to_initial(&mut self) {
-        if self.cp.lock { return; }
+        if self.cp_search_in_progress() {
+            self.cp_cancel_search();
+        }
+        if self.cp.lock {
+            return;
+        }
         self.cp.anim = None;
         self.cp.erased_cols = None;
         self.cp.next_cols = None;
@@ -769,10 +1296,177 @@ impl App {
         self.cp.lock = false;
     }
 
-    fn cp_place_random(&mut self) {
-        if self.cp.lock || self.cp.anim.is_some() { return; }
+    fn cp_cancel_search(&mut self) {
+        if let Some(cancel) = &self.cp.search_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cp_finish_search_thread(&mut self) {
+        if let Some(handle) = self.cp.search_thread.take() {
+            let _ = handle.join();
+        }
+        self.cp.search_cancel = None;
+    }
+
+    fn cp_handle_search_found(&mut self, depth: usize, mv: CpMove) {
         // 事前スナップショット
-        self.cp.undo_stack.push(SavedState { cols: self.cp.cols, pair_index: self.cp.pair_index });
+        self.cp.undo_stack.push(SavedState {
+            cols: self.cp.cols,
+            pair_index: self.cp.pair_index,
+        });
+
+        let pair = self.cp_current_pair();
+        self.cp_place_with(mv.x, mv.orient, pair);
+        self.cp_check_and_start_chain();
+
+        let target = self
+            .cp
+            .pending_target
+            .take()
+            .unwrap_or_else(|| self.cp.target_chain.max(1));
+        self.push_log(format!(
+            "目標{}連鎖: 深さ{}で列{}{}に配置",
+            target,
+            depth,
+            mv.x + 1,
+            orient_symbol(mv.orient)
+        ));
+    }
+
+    fn cp_handle_search_failure(&mut self) {
+        let target = self
+            .cp
+            .pending_target
+            .take()
+            .unwrap_or_else(|| self.cp.target_chain.max(1));
+        self.push_log(format!(
+            "目標{}連鎖に到達する配置が見つかりませんでした",
+            target
+        ));
+    }
+
+    fn cp_handle_search_cancel(&mut self) {
+        if let Some(target) = self.cp.pending_target.take() {
+            self.push_log(format!("目標{}連鎖の探索を中断しました", target));
+        } else {
+            self.push_log("目標連鎖の探索を中断しました".into());
+        }
+    }
+
+    fn cp_poll_search(&mut self) {
+        if let Some(rx) = self.cp.search_rx.take() {
+            let mut keep_rx = true;
+            let mut finalize = false;
+            let mut receiver = Some(rx);
+            loop {
+                let Some(current) = receiver.as_ref() else {
+                    break;
+                };
+                match current.try_recv() {
+                    Ok(CpSearchMessage::DepthStart { depth_limit }) => {
+                        self.cp.search_depth_limit = Some(depth_limit);
+                        self.cp.search_status = None;
+                    }
+                    Ok(CpSearchMessage::Progress(status)) => {
+                        self.cp.search_depth_limit = Some(status.depth_limit);
+                        self.cp.search_status = Some(status);
+                    }
+                    Ok(CpSearchMessage::Found { depth, mv }) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_found(depth, mv);
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Ok(CpSearchMessage::Failed) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_failure();
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Ok(CpSearchMessage::Cancelled) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp_handle_search_cancel();
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        self.cp.search_status = None;
+                        self.cp.search_depth_limit = None;
+                        self.cp.pending_target = None;
+                        self.push_log("目標連鎖探索が異常終了しました".into());
+                        receiver = None;
+                        keep_rx = false;
+                        finalize = true;
+                        break;
+                    }
+                }
+            }
+
+            if keep_rx {
+                if let Some(rx) = receiver {
+                    self.cp.search_rx = Some(rx);
+                }
+            }
+
+            if finalize {
+                self.cp_finish_search_thread();
+            }
+        }
+    }
+
+    fn cp_place_target(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() || self.cp_search_in_progress() {
+            return;
+        }
+        if self.cp.pair_seq.is_empty() {
+            self.push_log("手順が設定されていません".into());
+            return;
+        }
+
+        let target = self.cp.target_chain.max(1);
+        let len = self.cp.pair_seq.len();
+        let start_idx = self.cp.pair_index % len;
+        let cols = self.cp.cols;
+        let seq = self.cp.pair_seq.clone();
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            cp_run_target_search(cols, seq, start_idx, target, tx, cancel_thread);
+        });
+
+        self.cp.search_rx = Some(rx);
+        self.cp.search_thread = Some(handle);
+        self.cp.search_cancel = Some(cancel);
+        self.cp.search_status = None;
+        self.cp.search_depth_limit = None;
+        self.cp.pending_target = Some(target);
+
+        self.push_log(format!("目標{}連鎖の探索を開始", target));
+    }
+
+    fn cp_place_random(&mut self) {
+        if self.cp.lock || self.cp.anim.is_some() || self.cp_search_in_progress() {
+            return;
+        }
+        // 事前スナップショット
+        self.cp.undo_stack.push(SavedState {
+            cols: self.cp.cols,
+            pair_index: self.cp.pair_index,
+        });
 
         let pair = self.cp_current_pair();
         let mut rng = rand::thread_rng();
@@ -782,18 +1476,25 @@ impl App {
         for x in 0..W {
             // 垂直（Up/Down）: 同一列に2個置けるか
             let h = self.cp_col_height(x);
-            if h + 1 < H { moves.push((x, Orient::Up)); moves.push((x, Orient::Down)); }
+            if h + 1 < H {
+                moves.push((x, Orient::Up));
+                moves.push((x, Orient::Down));
+            }
             // 右
             if x + 1 < W {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x + 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Right)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Right));
+                }
             }
             // 左
             if x >= 1 {
                 let h0 = self.cp_col_height(x);
                 let h1 = self.cp_col_height(x - 1);
-                if h0 < H && h1 < H { moves.push((x, Orient::Left)); }
+                if h0 < H && h1 < H {
+                    moves.push((x, Orient::Left));
+                }
             }
         }
         if moves.is_empty() {
@@ -842,15 +1543,14 @@ impl App {
     }
 
     fn cp_col_height(&self, x: usize) -> usize {
-        let occ = (self.cp.cols[0][x] | self.cp.cols[1][x] | self.cp.cols[2][x] | self.cp.cols[3][x]) & MASK14;
-        occ.count_ones() as usize
+        col_height_from_cols(&self.cp.cols, x)
     }
 
     fn cp_set_cell(&mut self, x: usize, y: usize, color: u8) {
-        if x >= W || y >= H { return; }
-        let bit = 1u16 << y;
-        let c = (color as usize).min(3);
-        self.cp.cols[c][x] |= bit;
+        if x >= W || y >= H {
+            return;
+        }
+        set_cell_in_cols(&mut self.cp.cols, x, y, color);
     }
 
     fn cp_check_and_start_chain(&mut self) {
@@ -869,19 +1569,29 @@ impl App {
         self.cp.erased_cols = Some(erased);
         self.cp.next_cols = Some(next);
         self.cp.cols = erased; // 消えた状態を表示
-        self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+        self.cp.anim = Some(AnimState {
+            phase: AnimPhase::AfterErase,
+            since: Instant::now(),
+        });
     }
 
     fn cp_step_animation(&mut self) {
-        let Some(anim) = self.cp.anim else { return; };
+        let Some(anim) = self.cp.anim else {
+            return;
+        };
         let elapsed = anim.since.elapsed();
-        if elapsed < Duration::from_millis(500) { return; }
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
         match anim.phase {
             AnimPhase::AfterErase => {
                 if let Some(next) = self.cp.next_cols.take() {
                     self.cp.cols = next;
                 }
-                self.cp.anim = Some(AnimState { phase: AnimPhase::AfterFall, since: Instant::now() });
+                self.cp.anim = Some(AnimState {
+                    phase: AnimPhase::AfterFall,
+                    since: Instant::now(),
+                });
                 // 次の消去準備は AfterFall 経由
             }
             AnimPhase::AfterFall => {
@@ -900,7 +1610,10 @@ impl App {
                     self.cp.cols = erased;
                     self.cp.erased_cols = Some(erased);
                     self.cp.next_cols = Some(next);
-                    self.cp.anim = Some(AnimState { phase: AnimPhase::AfterErase, since: Instant::now() });
+                    self.cp.anim = Some(AnimState {
+                        phase: AnimPhase::AfterErase,
+                        since: Instant::now(),
+                    });
                 }
             }
         }
@@ -972,7 +1685,9 @@ impl App {
 }
 
 fn has_profile_any(p: &ProfileTotals) -> bool {
-    if p.io_write_total != Duration::ZERO { return true; }
+    if p.io_write_total != Duration::ZERO {
+        return true;
+    }
     for i in 0..=W {
         let t = p.dfs_times[i];
         if t.gen_candidates != Duration::ZERO
@@ -983,13 +1698,22 @@ fn has_profile_any(p: &ProfileTotals) -> bool {
             || t.leaf_memo_get != Duration::ZERO
             || t.leaf_memo_miss_compute != Duration::ZERO
             || t.out_serialize != Duration::ZERO
-        { return true; }
+        {
+            return true;
+        }
         let c = p.dfs_counts[i];
-        if c.nodes != 0 || c.cand_generated != 0 || c.pruned_upper != 0
+        if c.nodes != 0
+            || c.cand_generated != 0
+            || c.pruned_upper != 0
             || c.leaves != 0
             || c.leaf_pre_tshort != 0
             || c.leaf_pre_e1_impossible != 0
-            || c.memo_lhit != 0 || c.memo_ghit != 0 || c.memo_miss != 0 { return true; }
+            || c.memo_lhit != 0
+            || c.memo_ghit != 0
+            || c.memo_miss != 0
+        {
+            return true;
+        }
     }
     false
 }
@@ -1004,53 +1728,60 @@ fn fmt_dur_ms(d: Duration) -> String {
 }
 
 fn show_profile_table(ui: &mut egui::Ui, p: &ProfileTotals) {
-    ui.monospace(format!("I/O 書き込み合計: {}", fmt_dur_ms(p.io_write_total)));
+    ui.monospace(format!(
+        "I/O 書き込み合計: {}",
+        fmt_dur_ms(p.io_write_total)
+    ));
     ui.add_space(4.0);
-    egui::Grid::new("profile-grid").striped(true).num_columns(16).show(ui, |ui| {
-        ui.monospace("深さ");
-        ui.monospace("nodes");
-        ui.monospace("cand");
-        ui.monospace("pruned");
-        ui.monospace("leaves");
-        ui.monospace("pre_thres");
-        ui.monospace("pre_e1ng");
-        ui.monospace("L-hit");
-        ui.monospace("G-hit");
-        ui.monospace("Miss");
-        ui.monospace("gen");
-        ui.monospace("assign");
-        ui.monospace("upper");
-        ui.monospace("fall");
-        ui.monospace("hash");
-        ui.monospace("memo_get/miss_compute/out");
-        ui.end_row();
-
-        for d in 0..=W {
-            let c = p.dfs_counts[d];
-            let t = p.dfs_times[d];
-            ui.monospace(format!("{:>2}", d));
-            ui.monospace(format!("{}", c.nodes));
-            ui.monospace(format!("{}", c.cand_generated));
-            ui.monospace(format!("{}", c.pruned_upper));
-            ui.monospace(format!("{}", c.leaves));
-            ui.monospace(format!("{}", c.leaf_pre_tshort));
-            ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
-            ui.monospace(format!("{}", c.memo_lhit));
-            ui.monospace(format!("{}", c.memo_ghit));
-            ui.monospace(format!("{}", c.memo_miss));
-            ui.monospace(fmt_dur_ms(t.gen_candidates));
-            ui.monospace(fmt_dur_ms(t.assign_cols));
-            ui.monospace(fmt_dur_ms(t.upper_bound));
-            ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
-            ui.monospace(fmt_dur_ms(t.leaf_hash));
-            ui.monospace(format!("{} / {} / {}",
-                fmt_dur_ms(t.leaf_memo_get),
-                fmt_dur_ms(t.leaf_memo_miss_compute),
-                fmt_dur_ms(t.out_serialize),
-            ));
+    egui::Grid::new("profile-grid")
+        .striped(true)
+        .num_columns(16)
+        .show(ui, |ui| {
+            ui.monospace("深さ");
+            ui.monospace("nodes");
+            ui.monospace("cand");
+            ui.monospace("pruned");
+            ui.monospace("leaves");
+            ui.monospace("pre_thres");
+            ui.monospace("pre_e1ng");
+            ui.monospace("L-hit");
+            ui.monospace("G-hit");
+            ui.monospace("Miss");
+            ui.monospace("gen");
+            ui.monospace("assign");
+            ui.monospace("upper");
+            ui.monospace("fall");
+            ui.monospace("hash");
+            ui.monospace("memo_get/miss_compute/out");
             ui.end_row();
-        }
-    });
+
+            for d in 0..=W {
+                let c = p.dfs_counts[d];
+                let t = p.dfs_times[d];
+                ui.monospace(format!("{:>2}", d));
+                ui.monospace(format!("{}", c.nodes));
+                ui.monospace(format!("{}", c.cand_generated));
+                ui.monospace(format!("{}", c.pruned_upper));
+                ui.monospace(format!("{}", c.leaves));
+                ui.monospace(format!("{}", c.leaf_pre_tshort));
+                ui.monospace(format!("{}", c.leaf_pre_e1_impossible));
+                ui.monospace(format!("{}", c.memo_lhit));
+                ui.monospace(format!("{}", c.memo_ghit));
+                ui.monospace(format!("{}", c.memo_miss));
+                ui.monospace(fmt_dur_ms(t.gen_candidates));
+                ui.monospace(fmt_dur_ms(t.assign_cols));
+                ui.monospace(fmt_dur_ms(t.upper_bound));
+                ui.monospace(fmt_dur_ms(t.leaf_fall_pre));
+                ui.monospace(fmt_dur_ms(t.leaf_hash));
+                ui.monospace(format!(
+                    "{} / {} / {}",
+                    fmt_dur_ms(t.leaf_memo_get),
+                    fmt_dur_ms(t.leaf_memo_miss_compute),
+                    fmt_dur_ms(t.out_serialize),
+                ));
+                ui.end_row();
+            }
+        });
 }
 
 #[derive(Clone, Copy)]
@@ -1158,16 +1889,15 @@ fn draw_preview(ui: &mut egui::Ui, cols: &[[u16; W]; 4]) {
     let width = W as f32 * cell + (W - 1) as f32 * gap;
     let height = H as f32 * cell + (H - 1) as f32 * gap;
 
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     // 0=R, 1=G, 2=B, 3=Y
     let palette = [
-        Color32::from_rgb(239, 68, 68),   // red
-        Color32::from_rgb(34, 197, 94),   // green
-        Color32::from_rgb(59, 130, 246),  // blue
-        Color32::from_rgb(234, 179, 8),   // yellow
+        Color32::from_rgb(239, 68, 68),  // red
+        Color32::from_rgb(34, 197, 94),  // green
+        Color32::from_rgb(59, 130, 246), // blue
+        Color32::from_rgb(234, 179, 8),  // yellow
     ];
 
     for y in 0..H {
@@ -1356,7 +2086,9 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         let mut best_sat = -1i32;
         let mut best_deg = -1i32;
         for v in 0..color.len() {
-            if color[v] != 4 { continue; }
+            if color[v] != 4 {
+                continue;
+            }
             let sat = used_mask[v].count_ones() as i32;
             let deg = adj[v].count_ones() as i32;
             if sat > best_sat || (sat == best_sat && deg > best_deg) {
@@ -1370,9 +2102,13 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
         // 使える色を列挙（4色から used を除く）+ 対称性破り
         let forbid = used_mask[v];
         let mut new_color_limit = (max_used + 1).min(3);
-        if vleft == total_n { new_color_limit = 0; } // 最初の1手は 0 のみ
+        if vleft == total_n {
+            new_color_limit = 0;
+        } // 最初の1手は 0 のみ
         for c in 0u8..=new_color_limit {
-            if ((forbid >> c) & 1) != 0 { continue; }
+            if ((forbid >> c) & 1) != 0 {
+                continue;
+            }
             color[v] = c;
 
             // 近傍の used_mask を更新
@@ -1387,7 +2123,15 @@ fn enumerate_colorings_fast(info: &AbstractInfo) -> Vec<Vec<u8>> {
                 }
             }
             let next_max_used = if c > max_used { c } else { max_used };
-            dfs(vleft - 1, total_n, adj, color, used_mask, out, next_max_used);
+            dfs(
+                vleft - 1,
+                total_n,
+                adj,
+                color,
+                used_mask,
+                out,
+                next_max_used,
+            );
 
             // ロールバック
             color[v] = 4;
@@ -1557,7 +2301,15 @@ fn stream_column_candidates_timed<F: FnMut([u16; 4])>(
     }
     let mut masks = [0u16; 4];
     let mut last_start = Instant::now();
-    rec(0, false, col, &mut masks, enum_time, &mut last_start, &mut yield_masks);
+    rec(
+        0,
+        false,
+        col,
+        &mut masks,
+        enum_time,
+        &mut last_start,
+        &mut yield_masks,
+    );
     *enum_time += last_start.elapsed();
 }
 
@@ -1614,7 +2366,9 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::is_x86_feature_detected!("bmi2") {
-            unsafe { return fall_cols_bmi2(cols_in); }
+            unsafe {
+                return fall_cols_bmi2(cols_in);
+            }
         }
     }
     fall_cols(cols_in)
@@ -1623,10 +2377,10 @@ fn fall_cols_fast(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn fall_cols_bmi2(cols_in: &[[u16; W]; 4]) -> [[u16; W]; 4] {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_pdep_u32, _pext_u32};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{_pdep_u32, _pext_u32};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_pdep_u32, _pext_u32};
 
     let mut out = [[0u16; W]; 4];
 
@@ -1875,7 +2629,9 @@ fn reaches_t_from_pre_single_e1(pre: &[[u16; W]; 4], t: u32, exact_four_only: bo
         let mut clr: BB = 0;
         let mut tot: u32 = 0;
         for &bb in bb_pre.iter() {
-            if bb.count_ones() < 4 { continue; }
+            if bb.count_ones() < 4 {
+                continue;
+            }
             let mut s = bb;
             while s != 0 {
                 let seed = s & (!s + 1);
@@ -2165,7 +2921,11 @@ fn canonical_hash64_fast(cols: &[[u16; W]; 4]) -> (u64, bool) {
     } else {
         let h0 = canonical_hash64_oriented_bits(cols, false);
         let h1 = canonical_hash64_oriented_bits(cols, true);
-        if h0 <= h1 { (h0, false) } else { (h1, true) }
+        if h0 <= h1 {
+            (h0, false)
+        } else {
+            (h1, true)
+        }
     }
 }
 
@@ -2342,10 +3102,8 @@ struct ApproxLru {
 impl ApproxLru {
     fn new(limit: usize) -> Self {
         let cap = (limit.saturating_mul(11) / 10).max(16);
-        let map: U64Map<bool> = std::collections::HashMap::with_capacity_and_hasher(
-            cap,
-            BuildNoHashHasher::default(),
-        );
+        let map: U64Map<bool> =
+            std::collections::HashMap::with_capacity_and_hasher(cap, BuildNoHashHasher::default());
         let q = VecDeque::with_capacity(cap);
         Self { limit, map, q }
     }
@@ -2457,9 +3215,11 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].memo_miss += 1;
         }
         *mmiss_batch += 1;
-        let reached = prof!(profile_enabled, time_batch.dfs_times[depth].leaf_memo_miss_compute, {
-            reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only)
-        });
+        let reached = prof!(
+            profile_enabled,
+            time_batch.dfs_times[depth].leaf_memo_miss_compute,
+            { reaches_t_from_pre_single_e1(&pre, threshold, exact_four_only) }
+        );
         if !reached {
             // 統計フラッシュ（従来通り）
             if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
@@ -2530,12 +3290,23 @@ fn dfs_combine_parallel(
                 }
 
                 // 出力整形
-                let line = prof!(profile_enabled, time_batch.dfs_times[depth].out_serialize, {
-                    let key_str = encode_canonical_string(&pre, mirror);
-                    let hash = fnv1a32(&key_str);
-                    let rows = serialize_board_from_cols(&pre);
-                    make_json_line_str(&key_str, hash, threshold, &rows, map_label_to_color, mirror)
-                });
+                let line = prof!(
+                    profile_enabled,
+                    time_batch.dfs_times[depth].out_serialize,
+                    {
+                        let key_str = encode_canonical_string(&pre, mirror);
+                        let hash = fnv1a32(&key_str);
+                        let rows = serialize_board_from_cols(&pre);
+                        make_json_line_str(
+                            &key_str,
+                            hash,
+                            threshold,
+                            &rows,
+                            map_label_to_color,
+                            mirror,
+                        )
+                    }
+                );
                 batch.push(line);
                 *outputs_batch += 1;
 
@@ -2594,9 +3365,23 @@ fn dfs_combine_parallel(
             time_batch.dfs_counts[depth].pruned_upper += 1;
         }
         if (*nodes_batch >= 4096 || t0.elapsed().as_millis() % 500 == 0)
-            && (*nodes_batch > 0 || *leaves_batch > 0 || *outputs_batch > 0 || *pruned_batch > 0 || *lhit_batch > 0 || *ghit_batch > 0 || *mmiss_batch > 0)
+            && (*nodes_batch > 0
+                || *leaves_batch > 0
+                || *outputs_batch > 0
+                || *pruned_batch > 0
+                || *lhit_batch > 0
+                || *ghit_batch > 0
+                || *mmiss_batch > 0)
         {
-            let _ = stat_sender.send(StatDelta { nodes: *nodes_batch, leaves: *leaves_batch, outputs: *outputs_batch, pruned: *pruned_batch, lhit: *lhit_batch, ghit: *ghit_batch, mmiss: *mmiss_batch });
+            let _ = stat_sender.send(StatDelta {
+                nodes: *nodes_batch,
+                leaves: *leaves_batch,
+                outputs: *outputs_batch,
+                pruned: *pruned_batch,
+                lhit: *lhit_batch,
+                ghit: *ghit_batch,
+                mmiss: *mmiss_batch,
+            });
             *nodes_batch = 0;
             *leaves_batch = 0;
             *outputs_batch = 0;
@@ -2798,7 +3583,8 @@ fn run_search(
         let bmi2 = std::is_x86_feature_detected!("bmi2");
         let popcnt = std::is_x86_feature_detected!("popcnt");
         let _ = tx.send(Message::Log(format!(
-            "CPU features: bmi2={} / popcnt={}", bmi2, popcnt
+            "CPU features: bmi2={} / popcnt={}",
+            bmi2, popcnt
         )));
     }
 
@@ -2879,9 +3665,11 @@ fn run_search(
     let tx_progress = tx.clone();
     let total_clone = total.clone();
     let abort_for_agg = abort.clone();
-    let global_output_once: Arc<DU64Set> = Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
+    let global_output_once: Arc<DU64Set> =
+        Arc::new(DU64Set::with_hasher(BuildNoHashHasher::default()));
     // グローバル memo は get を廃止（挿入もしない方針）
-    let global_memo: Arc<DU64Map<bool>> = Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
+    let global_memo: Arc<DU64Map<bool>> =
+        Arc::new(DU64Map::with_hasher(BuildNoHashHasher::default()));
 
     let global_memo_for_agg = global_memo.clone();
     let lru_limit_for_agg = lru_limit;
@@ -2991,10 +3779,8 @@ fn run_search(
     });
 
     // metas を並列探索
-    metas
-        .par_iter()
-        .enumerate()
-        .try_for_each(|(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
+    metas.par_iter().enumerate().try_for_each(
+        |(i, (map_label_to_color, gens, max_fill, order))| -> Result<()> {
             if abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -3019,10 +3805,15 @@ fn run_search(
                 first_candidates
                     .par_iter()
                     .try_for_each(|masks| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         let mut cols0 = [[0u16; W]; 4];
-                        for c in 0..4 { cols0[c][first_x] = masks[c]; }
-                        let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                        for c in 0..4 {
+                            cols0[c][first_x] = masks[c];
+                        }
+                        let mut memo =
+                            ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                         let mut local_output_once: U64Set = U64Set::default();
                         let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3072,9 +3863,26 @@ fn run_search(
                             &remain_suffix,
                         );
 
-                        if !batch.is_empty() { let _ = wtx.send(batch); }
-                        if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                            let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                        if !batch.is_empty() {
+                            let _ = wtx.send(batch);
+                        }
+                        if nodes_batch > 0
+                            || leaves_batch > 0
+                            || outputs_batch > 0
+                            || pruned_batch > 0
+                            || lhit_batch > 0
+                            || ghit_batch > 0
+                            || mmiss_batch > 0
+                        {
+                            let _ = stx.send(StatDelta {
+                                nodes: nodes_batch,
+                                leaves: leaves_batch,
+                                outputs: outputs_batch,
+                                pruned: pruned_batch,
+                                lhit: lhit_batch,
+                                ghit: ghit_batch,
+                                mmiss: mmiss_batch,
+                            });
                         }
                         if profile_enabled && time_delta_has_any(&time_batch) {
                             let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3094,16 +3902,21 @@ fn run_search(
                 second_candidates
                     .par_iter()
                     .try_for_each(|m2| -> Result<()> {
-                        if abort.load(Ordering::Relaxed) { return Ok(()); }
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         for masks in &first_candidates {
-                            if abort.load(Ordering::Relaxed) { break; }
+                            if abort.load(Ordering::Relaxed) {
+                                break;
+                            }
 
                             let mut cols0 = [[0u16; W]; 4];
                             for c in 0..4 {
                                 cols0[c][first_x] = masks[c];
                                 cols0[c][second_x] = m2[c];
                             }
-                            let mut memo = ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
+                            let mut memo =
+                                ApproxLru::new(lru_limit / rayon::current_num_threads().max(1));
                             let mut local_output_once: U64Set = U64Set::default();
                             let mut batch: Vec<String> = Vec::with_capacity(256);
 
@@ -3118,7 +3931,9 @@ fn run_search(
 
                             let mut time_batch = TimeDelta::default();
 
-                            let placed2: u32 = (0..4).map(|c| masks[c].count_ones() + m2[c].count_ones()).sum();
+                            let placed2: u32 = (0..4)
+                                .map(|c| masks[c].count_ones() + m2[c].count_ones())
+                                .sum();
                             let _ = dfs_combine_parallel(
                                 2,
                                 &mut cols0,
@@ -3153,9 +3968,26 @@ fn run_search(
                                 &remain_suffix,
                             );
 
-                            if !batch.is_empty() { let _ = wtx.send(batch); }
-                            if nodes_batch > 0 || leaves_batch > 0 || outputs_batch > 0 || pruned_batch > 0 || lhit_batch > 0 || ghit_batch > 0 || mmiss_batch > 0 {
-                                let _ = stx.send(StatDelta { nodes: nodes_batch, leaves: leaves_batch, outputs: outputs_batch, pruned: pruned_batch, lhit: lhit_batch, ghit: ghit_batch, mmiss: mmiss_batch });
+                            if !batch.is_empty() {
+                                let _ = wtx.send(batch);
+                            }
+                            if nodes_batch > 0
+                                || leaves_batch > 0
+                                || outputs_batch > 0
+                                || pruned_batch > 0
+                                || lhit_batch > 0
+                                || ghit_batch > 0
+                                || mmiss_batch > 0
+                            {
+                                let _ = stx.send(StatDelta {
+                                    nodes: nodes_batch,
+                                    leaves: leaves_batch,
+                                    outputs: outputs_batch,
+                                    pruned: pruned_batch,
+                                    lhit: lhit_batch,
+                                    ghit: ghit_batch,
+                                    mmiss: mmiss_batch,
+                                });
                             }
                             if profile_enabled && time_delta_has_any(&time_batch) {
                                 let _ = tx.send(Message::TimeDelta(time_batch));
@@ -3165,11 +3997,14 @@ fn run_search(
                     })?;
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     drop(wtx);
     drop(stx);
-    let writer_result = writer_handle.join().map_err(|_| anyhow!("writer join error"))?;
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer join error"))?;
     writer_result?;
     agg_handle.join().map_err(|_| anyhow!("agg join error"))?;
 
@@ -3179,8 +4014,7 @@ fn run_search(
 // ユーティリティ：配列初期化（const generics）
 fn array_init<T, F: FnMut(usize) -> T, const N: usize>(mut f: F) -> [T; N] {
     use std::mem::MaybeUninit;
-    let mut data: [MaybeUninit<T>; N] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+    let mut data: [MaybeUninit<T>; N] = unsafe { MaybeUninit::uninit().assume_init() };
     for (i, slot) in data.iter_mut().enumerate() {
         slot.write(f(i));
     }
